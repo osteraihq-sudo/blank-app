@@ -365,129 +365,6 @@ def save_media(upload) -> Tuple[str, Optional[str], str, str]:
         path, thumb = save_video(upload, ext2)
         return path, thumb, mime, "video"
 
-# ==================== (ADDED) FACTORY RESET: FUNCTIONS ONLY ====================
-def _collect_family_upload_paths(family: str) -> List[str]:
-    """Grab upload file paths for posts in a given family so we can delete files after DB purge."""
-    rows = q(
-        """SELECT pm.path, pm.thumb_path
-             FROM post_media pm
-             JOIN posts p ON p.id=pm.post_id
-            WHERE p.family=?""",
-        (family,),
-    )
-    paths = []
-    for r in rows:
-        if r["path"]: paths.append(r["path"])
-        if r["thumb_path"]: paths.append(r["thumb_path"])
-    return paths
-
-def _safe_unlink(path: str):
-    try:
-        if path and os.path.exists(path) and os.path.isfile(path):
-            os.remove(path)
-    except Exception:
-        pass  # ignore filesystem hiccups
-
-def factory_reset(scope: str, family: str, delete_uploads: bool = True) -> Dict[str, int]:
-    """
-    Purge tester data without touching schema. Returns row counts deleted per table.
-    scope: "family" (current FAMILY only) or "all" (entire DB)
-    """
-    conn = get_conn()
-    cur = conn.cursor()
-    counts: Dict[str, int] = {}
-
-    # Pre-collect files to delete (must be done before DB deletes)
-    files_to_delete: List[str] = []
-    if delete_uploads:
-        if scope == "family":
-            files_to_delete = _collect_family_upload_paths(family)
-        else:
-            # all files in uploads folder
-            try:
-                files_to_delete = [
-                    str(UPLOAD_DIR / fn)
-                    for fn in os.listdir(UPLOAD_DIR)
-                    if os.path.isfile(UPLOAD_DIR / fn)
-                ]
-            except Exception:
-                files_to_delete = []
-
-    # Tables that are directly keyed by family (children cascade from these)
-    family_tables = [
-        "notes",        # → comments, reactions cascade by FK
-        "lists",        # → list_items cascade
-        "documents",
-        "events",
-        "posts",        # → post_media, post_likes, post_comments cascade
-        "albums",
-        "chat_messages",
-    ]
-
-    try:
-        cur.execute("BEGIN;")
-
-        if scope == "family":
-            for t in family_tables:
-                cur.execute(f"SELECT COUNT(*) c FROM {t} WHERE family=?", (family,))
-                counts[t] = cur.fetchone()["c"]
-            # Delete per-family (children should cascade)
-            for t in family_tables:
-                cur.execute(f"DELETE FROM {t} WHERE family=?", (family,))
-        else:
-            # Count everything first
-            for t in family_tables + ["list_items", "post_media", "post_likes", "post_comments", "comments", "reactions"]:
-                try:
-                    cur.execute(f"SELECT COUNT(*) c FROM {t}")
-                    counts[t] = cur.fetchone()["c"]
-                except Exception:
-                    pass
-            # Full wipe of app data (schema stays)
-            for t in ["post_comments","post_likes","post_media","list_items","comments","reactions"]:
-                # children first in case any FK doesn’t cascade
-                cur.execute(f"DELETE FROM {t}")
-            for t in family_tables:
-                cur.execute(f"DELETE FROM {t}")
-
-            # Reset AUTOINCREMENT counters so IDs start fresh
-            try:
-                cur.execute("DELETE FROM sqlite_sequence WHERE name IN ("
-                            "'notes','lists','list_items','documents','comments','reactions',"
-                            "'events','albums','posts','post_media','post_likes','post_comments','chat_messages');")
-            except Exception:
-                pass
-
-        cur.execute("COMMIT;")
-    except Exception as e:
-        try:
-            cur.execute("ROLLBACK;")
-        except Exception:
-            pass
-        st.error(f"Factory reset aborted: {e}")
-        return {}
-
-    # Remove files on disk (after commit so we don't orphan DB state if deletion fails)
-    if delete_uploads and files_to_delete:
-        for p in files_to_delete:
-            _safe_unlink(p)
-
-    # If doing full wipe and asked to delete uploads, also remove any stragglers in folder
-    if delete_uploads and scope == "all":
-        try:
-            for fn in os.listdir(UPLOAD_DIR):
-                _safe_unlink(str(UPLOAD_DIR / fn))
-        except Exception:
-            pass
-
-    # Vacuum to reclaim space
-    try:
-        conn.execute("VACUUM;")
-    except Exception:
-        pass
-
-    return counts
-# ==================== END (ADDED) FACTORY RESET FUNCTIONS ====================
-
 # ==================== APP ====================
 st.set_page_config(page_title="🐝 The Hive", layout="wide")
 init_schema()
@@ -502,6 +379,10 @@ with st.sidebar:
     who = st.selectbox("Color preset", list(COLOR_PRESETS.keys()), index=0)
     preset_color = COLOR_PRESETS[who]
     st.markdown("---")
+    auto = st.checkbox("Auto-refresh (every N sec)", value=False)
+    secs = st.slider("Refresh interval", 2, 15, 5)
+    if auto: st_autorefresh(interval=secs*1000, key="auto")
+    st.markdown("---")
     st.caption("Corkboard filters")
     f_search = st.text_input("Search text")
     f_assignee = st.text_input("Assignee contains")
@@ -510,38 +391,6 @@ with st.sidebar:
 
 DISPLAY_NAME = st.session_state["user"] or "Guest"
 FAMILY = st.session_state["family"] or "public"
-
-# ==================== (ADDED) FACTORY RESET: SIDEBAR UI ====================
-with st.sidebar:
-    st.markdown("---")
-    with st.expander("🧨 Danger Zone: Factory Reset (Data Only)", expanded=False):
-        st.caption("This purges tester data without touching code or schema.")
-        scope = st.radio("Scope", ["Current Family only", "ALL Families"], index=0, horizontal=False)
-        delete_uploads = st.checkbox("Also delete uploaded files (images/videos/thumbnails)", value=True)
-        if scope == "Current Family only":
-            st.caption(f"Target family: **{esc(FAMILY)}**")
-            confirm_text = st.text_input("Type the family name to confirm", placeholder="exact match required")
-            armed = (confirm_text.strip() == FAMILY.strip())
-            scope_key = "family"
-        else:
-            st.caption("This will remove *all* app data across families.")
-            confirm_text = st.text_input("Type: ERASE-ALL (exactly)", placeholder="ERASE-ALL")
-            armed = (confirm_text.strip() == "ERASE-ALL")
-            scope_key = "all"
-
-        really = st.checkbox("I understand this cannot be undone.", value=False)
-        btn = st.button("🔥 Run Factory Reset", type="primary", disabled=not (armed and really))
-
-        if btn:
-            stats = factory_reset(scope_key, FAMILY, delete_uploads=delete_uploads)
-            if stats:
-                st.success("Factory reset complete.")
-                with st.expander("Details", expanded=False):
-                    for t, c in sorted(stats.items()):
-                        st.write(f"{t}: {c} row(s) deleted")
-            else:
-                st.warning("No rows deleted or operation aborted.")
-# ==================== END (ADDED) FACTORY RESET SIDEBAR UI ====================
 
 st.title("🐝 The Hive")
 st.caption(f"Welcome, {esc(DISPLAY_NAME)} — Family: {esc(FAMILY)}")

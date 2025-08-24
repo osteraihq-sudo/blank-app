@@ -3,3 +3,4 @@ sqlmodel
 sqlalchemy
 streamlit-extras
 streamlit-elements
+streamlit-calendar
