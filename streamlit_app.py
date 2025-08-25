@@ -101,7 +101,20 @@ def _init_addon_schema():
             FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE
         );
     """)
+        # Users (per-family usernames with salted PBKDF2 hashes)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            family   TEXT NOT NULL,
+            username TEXT NOT NULL,
+            pw_hash  TEXT NOT NULL,
+            salt     TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(family, username)
+        );
+    """)
     c.commit()
+
 
 def _get_setting(family:str, key:str, default:str|None=None) -> str|None:
     rows = q("SELECT value FROM app_settings WHERE family=? AND key=? LIMIT 1", (family, key))
@@ -131,6 +144,31 @@ def _save_avatar(upload) -> str|None:
         return thumb or path
     except Exception:
         return None
+import hashlib
+
+def _pw_hash(password: str, salt_hex: str | None = None) -> tuple[str, str]:
+    if salt_hex is None:
+        import os
+        salt = os.urandom(16)
+        salt_hex = salt.hex()
+    else:
+        salt = bytes.fromhex(salt_hex)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
+    return salt_hex, dk.hex()
+
+def _create_user(family: str, username: str, password: str) -> None:
+    salt_hex, hash_hex = _pw_hash(password)
+    exec1("""INSERT INTO users(family, username, pw_hash, salt)
+             VALUES(?,?,?,?)""", (family, username, hash_hex, salt_hex))
+
+def _check_login(family: str, username: str, password: str) -> bool:
+    row = q("SELECT pw_hash, salt FROM users WHERE family=? AND username=? LIMIT 1",
+            (family, username))
+    if not row:
+        return False
+    salt_hex = row[0]["salt"]
+    _, try_hash = _pw_hash(password, salt_hex)
+    return try_hash == row[0]["pw_hash"]
 
 def _sticky_user_bootstrap():
     """
@@ -225,7 +263,6 @@ def _factory_reset_ui():
                 st.warning("Type RESET exactly to confirm.")
 # === END ADD-ON BLOCK A ===
 
-# ==================== CONFIG ====================
 # ==================== CONFIG ====================
 DB_PATH = Path(os.environ.get("HIVE_DB_PATH", "/tmp/hive.db"))
 UPLOAD_DIR = Path(os.environ.get("HIVE_UPLOAD_DIR", "/tmp/uploads"))
@@ -527,13 +564,54 @@ def save_media(upload) -> Tuple[str, Optional[str], str, str]:
         path, thumb = save_video(upload, ext2)
         return path, thumb, mime, "video"
 
-# ==================== APP ====================
+# ==================== APP BOOTSTRAP (paste this block) ====================
+import streamlit as st
+
 st.set_page_config(page_title="🐝 The Hive", layout="wide")
-init_schema()
+
+# 1) Make sure ALL tables exist first
+init_schema()          # core tables
+_init_addon_schema()   # addon tables (app_settings, users, profiles, RSVPs, ...)
+
+# 2) Theme CSS (safe after tables exist)
+_theme_css()
+
+# 3) Session defaults
+if "auth" not in st.session_state:
+    st.session_state["auth"] = False
+if "user" not in st.session_state:
+    st.session_state["user"] = None
+if "family" not in st.session_state:
+    st.session_state["family"] = "public"
+# Bind this browser session to the current epoch the first time
+if "session_epoch" not in st.session_state:
+    st.session_state["session_epoch"] = _get_setting("__GLOBAL__", "session_epoch") or "init"
+
+# 4) FORCE LOGOUT IF SESSION EPOCH IS STALE
+current_epoch = _get_setting("__GLOBAL__", "session_epoch") or "init"
+user_epoch = st.session_state.get("session_epoch", "init")
+
+if st.session_state.get("auth") and user_epoch != current_epoch:
+    st.session_state["auth"] = False
+    st.session_state["user"] = None
+    st.session_state["session_epoch"] = current_epoch
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+    st.toast("You've been signed out due to a system reset. Please sign in again.")
+    st.rerun()
+# ==================== END BOOTSTRAP ====================
+
+
 # === ADD-ON BLOCK B: Boot the add-on schema + sticky user + theme CSS ===
 _init_addon_schema()          # create add-on tables if missing
-_sticky_user_bootstrap()      # apply sticky user/family before sidebar reads them
 _theme_css()                  # inject contrast-safe CSS for light/dark
+# ---- Session defaults (since sticky bootstrap was removed)
+if "user" not in st.session_state:
+    st.session_state["user"] = "Guest"
+if "family" not in st.session_state:
+    st.session_state["family"] = "public"
 # === END ADD-ON BLOCK B ===
 # === ADD-ON BLOCK B++ : Max-contrast dark theme fix ===
 st.markdown("""
@@ -622,78 +700,14 @@ html[data-theme="dark"] .stApp .chip {
 </style>
 """, unsafe_allow_html=True)
 # === END ADD-ON BLOCK B++ ===
-# --------- Auth shim / Family selection ---------
-with st.sidebar:
-    st.header("⚙️ Controls")
-    if "user" not in st.session_state: st.session_state["user"] = "Guest"
-    if "family" not in st.session_state: st.session_state["family"] = "public"
-    st.text_input("Display name", key="user")
-    st.text_input("Family name", key="family", help="Use a unique family/group name to partition data.")
-    who = st.selectbox("Color preset", list(COLOR_PRESETS.keys()), index=0)
-    preset_color = COLOR_PRESETS[who]
-    # === ADD-ON BLOCK C (WRAPPED): Profile, Theme, Factory Reset — always in sidebar ===
-with st.sidebar:
-    st.markdown("---")
-    st.header("👤 Profile")
-
-    c0, c1 = st.columns([0.55, 0.45])
-    with c0:
-        first = st.text_input("First name", key="__first_name__", placeholder="e.g., Alex")
-    with c1:
-        last = st.text_input("Last name", key="__last_name__", placeholder="e.g., Morgan")
-
-    avatar_up = st.file_uploader(
-        "Profile photo (jpg/png)",
-        type=["jpg","jpeg","png"],
-        key="__avatar_up__",
-        accept_multiple_files=False
-    )
-
-    # Save / persist the profile tied to (FAMILY, DISPLAY_NAME)
-    if st.button("💾 Save Profile"):
-        fam = st.session_state.get("family") or "public"
-        user = st.session_state.get("user") or "Guest"
-        prof = _get_or_create_profile(fam, user, first, last)
-        if avatar_up is not None:
-            ap = _save_avatar(avatar_up)
-            if ap:
-                exec1(
-                    "UPDATE user_profiles SET avatar_path=?, first_name=?, last_name=? WHERE family=? AND username=?",
-                    (ap, first or None, last or None, fam, user)
-                )
-            else:
-                exec1(
-                    "UPDATE user_profiles SET first_name=?, last_name=? WHERE family=? AND username=?",
-                    (first or None, last or None, fam, user)
-                )
-        else:
-            exec1(
-                "UPDATE user_profiles SET first_name=?, last_name=? WHERE family=? AND username=?",
-                (first or None, last or None, fam, user)
-            )
-        _stick_user_to_url_and_settings(user, fam)
-        st.success("Profile saved and user anchored to URL. Refresh will keep you signed in.")
-
-    st.markdown("---")
-    auto = st.checkbox("Auto-refresh (every N sec)", value=False)
-    secs = st.slider("Refresh interval", 2, 15, 5)
-    if auto: st_autorefresh(interval=secs*1000, key="auto")
-    st.markdown("---")
-    st.caption("Corkboard filters")
-    f_search = st.text_input("Search text")
-    f_assignee = st.text_input("Assignee contains")
-    f_tags = st.text_input("Tags contains")
-    f_due = st.selectbox("Due filter", ["All","Due today","Overdue"])
-
-  # === ADD-ON BLOCK F (REPLACEMENT): Password-gated Factory Reset ===
+# === ADD-ON BLOCK F (REPLACEMENT): Password-gated Factory Reset ===
 def _factory_reset_ui_secured():
     with st.sidebar.expander("🧨 Admin · Factory Reset", expanded=False):
         st.caption("Admin-only. Enter password to unlock reset.")
 
-        # Password source: secrets or env var
+        # Load admin password from secrets or environment
         ADMIN_KEY = None
         try:
-            # .streamlit/secrets.toml -> ADMIN_RESET_PASSWORD = "yourpassword"
             if hasattr(st, "secrets") and "ADMIN_RESET_PASSWORD" in st.secrets:
                 ADMIN_KEY = st.secrets["ADMIN_RESET_PASSWORD"]
         except Exception:
@@ -703,17 +717,17 @@ def _factory_reset_ui_secured():
         pwd = st.text_input("Admin password", type="password", key="__reset_pwd__")
 
         if not ADMIN_KEY:
-            st.info("No admin password configured. Set `ADMIN_RESET_PASSWORD` in .streamlit/secrets.toml "
-                    "or env var `HIVE_ADMIN_RESET` to enable this.")
+            st.info("No admin password configured. Set `ADMIN_RESET_PASSWORD` in `.streamlit/secrets.toml` or env var `HIVE_ADMIN_RESET`.")
             return
 
         if pwd != ADMIN_KEY:
             st.caption("Enter the correct admin password to reveal the reset controls.")
             return
 
-        # Auth OK → show the original confirmation + wipe logic (inline)
+        # ✅ Admin authenticated
         st.success("Authenticated.")
         st.caption("Type **RESET** to purge all data (DB tables & /uploads).")
+
         txt = st.text_input("Confirm", key="__reset_confirm__", placeholder="RESET")
 
         if st.button("⚠️ Wipe everything"):
@@ -736,15 +750,20 @@ def _factory_reset_ui_secured():
                     exec1("DELETE FROM events", ())
                     exec1("DELETE FROM user_profiles", ())
                     exec1("DELETE FROM app_settings", ())
+                    exec1("DELETE FROM users", ())   # <-- wipe all user accounts
 
-                    # Nuke uploads directory
+                    # Rotate global session epoch to force logout
+                    from uuid import uuid4
+                    _set_setting("__GLOBAL__", "session_epoch", str(uuid4()))
+
+                    # Nuke uploaded files
                     try:
                         for p in UPLOAD_DIR.glob("*"):
                             p.unlink(missing_ok=True)
                     except Exception:
                         pass
 
-                    # Vacuum DB
+                    # Optimize database
                     exec1("VACUUM", ())
 
                     st.success("Factory reset complete.")
@@ -753,13 +772,101 @@ def _factory_reset_ui_secured():
                     st.error(f"Reset failed: {e}")
             else:
                 st.warning("Type RESET exactly to confirm.")
-
-_factory_reset_ui_secured()
 # === END ADD-ON BLOCK F ===
 
+# === FORCE LOGOUT IF SESSION EPOCH IS STALE ===
+current_epoch = _get_setting("__GLOBAL__", "session_epoch") or "init"
+user_epoch = st.session_state.get("session_epoch", "init")
+
+if st.session_state.get("auth") and user_epoch != current_epoch:
+    st.session_state["auth"] = False
+    st.session_state["user"] = None
+    st.session_state["session_epoch"] = None
+    st.toast("You've been signed out due to a system reset.")
+    st.rerun()
+
+# --------- Auth + Controls (SIDEBAR) ---------
+with st.sidebar:
+    st.header("🔐 Sign in")
+
+    fam_in = st.text_input("Family (group)", value=st.session_state.get("family", "public"))
+    st.session_state["family"] = (fam_in or "public").strip()
+    FAMILY = st.session_state["family"]
+
+    if not st.session_state.get("auth", False):
+        with st.form("auth_form", clear_on_submit=True):
+            u = st.text_input("Username")
+            p = st.text_input("Password", type="password")
+            c1, c2 = st.columns(2)
+            do_login = c1.form_submit_button("Sign in")
+            do_register = c2.form_submit_button("Register")
+
+        if do_register and u and p:
+            try:
+                _create_user(FAMILY, u, p)
+                _get_or_create_profile(FAMILY, u)
+                st.success("Account created — now click Sign in.")
+            except sqlite3.IntegrityError:
+                st.error("That username already exists in this family.")
+
+        if do_login and u and p:
+            if _check_login(FAMILY, u, p):
+                st.session_state["auth"] = True
+                st.session_state["user"] = u
+
+                # ✅ Store session epoch for future invalidation
+                session_epoch = _get_setting("__GLOBAL__", "session_epoch") or "init"
+                st.session_state["session_epoch"] = session_epoch
+
+                _stick_user_to_url_and_settings(u, FAMILY)
+                st.rerun()
+            else:
+                st.error("Incorrect username or password.")
+    else:
+        st.success(f"Signed in as {st.session_state.get('user','?')} · Family: {FAMILY}")
+        if st.button("Sign out"):
+            st.session_state["auth"] = False
+            st.session_state["user"] = None
+            st.session_state["session_epoch"] = None
+            try:
+                st.query_params.clear()
+            except Exception:
+                pass
+            st.rerun()
+
+    st.markdown("---")
+    st.header("⚙️ Controls")
+
+    who = st.selectbox("Color preset", list(COLOR_PRESETS.keys()), index=0)
+    preset_color = COLOR_PRESETS[who]
+
+    st.markdown("---")
+    auto = st.checkbox("Auto-refresh (every N sec)", value=False)
+    secs = st.slider("Refresh interval", 2, 15, 5)
+    if auto:
+        st_autorefresh(interval=secs * 1000, key="auto")
+
+    st.markdown("---")
+    st.caption("Corkboard filters")
+    f_search = st.text_input("Search text")
+    f_assignee = st.text_input("Assignee contains")
+    f_tags = st.text_input("Tags contains")
+    f_due = st.selectbox("Due filter", ["All", "Due today", "Overdue"])
+
+    # ✅ Secure reset button
+    _factory_reset_ui_secured()
+# --------- END SIDEBAR ---------
+
 # === END ADD-ON BLOCK C (WRAPPED) ===
-DISPLAY_NAME = st.session_state["user"] or "Guest"
-FAMILY = st.session_state["family"] or "public"
+DISPLAY_NAME = st.session_state.get("user", None)
+FAMILY       = st.session_state.get("family", "public")
+
+# Stop the app if not signed in
+if not st.session_state.get("auth"):
+    st.title("🐝 The Hive")
+    st.info("Please sign in from the sidebar to continue.")
+    st.stop()
+
 
 st.title("🐝 The Hive")
 st.caption(f"Welcome, {esc(DISPLAY_NAME)} — Family: {esc(FAMILY)}")
@@ -772,8 +879,9 @@ with tabs[0]:
 
     with st.form("add_note", clear_on_submit=True):
         st.markdown("#### New sticky")
-        type_choice = st.selectbox("Type", ["text","photo","link","reminder"])
-        c1, c2 = st.columns([4,1])
+        type_choice = st.selectbox("Type", ["text", "photo", "link", "reminder"])
+        c1, c2 = st.columns([4, 1])
+
         content_text = ""
         upload = None
         with c1:
@@ -782,52 +890,98 @@ with tabs[0]:
             elif type_choice == "link":
                 content_text = st.text_input("URL (http/https only)", placeholder="https://…")
             elif type_choice == "photo":
-                upload = st.file_uploader("Photo", type=["png","jpg","jpeg","gif"])
+                upload = st.file_uploader("Photo", type=["png", "jpg", "jpeg", "gif"])
             else:
                 content_text = st.text_input("Reminder text", placeholder="Take out trash")
+
         with c2:
-            color_mode = st.radio("Color", ["Preset","Custom"], horizontal=True)
+            color_mode = st.radio("Color", ["Preset", "Custom"], horizontal=True)
             color = preset_color if color_mode == "Preset" else st.color_picker("Pick", "#FFF176")
 
         m1, m2, m3 = st.columns(3)
-        with m1: assignee = st.text_input("Assignee (optional)", placeholder="e.g., Sam")
-        with m2: tags = st.text_input("Tags (comma separated)", placeholder="e.g., chores,urgent")
+        with m1:
+            assignee = st.text_input("Assignee (optional)", placeholder="e.g., Sam")
+        with m2:
+            tags = st.text_input("Tags (comma separated)", placeholder="e.g., chores,urgent")
         with m3:
             due_d = st.date_input("Due date", value=None)
-            due_t = st.time_input("Due time", value=None, step=300)
+            due_t = st.time_input("Due time", value=None, step=1800)
+
+        add_to_calendar = st.checkbox("📅 Also add to calendar", value=False, key="__add_to_calendar__")
 
         if st.form_submit_button("Add Note"):
+            # Validate/transform upload & inputs
             if type_choice == "photo":
-                if upload is None: st.error("Please upload a photo."); st.stop()
+                if upload is None:
+                    st.error("Please upload a photo."); st.stop()
                 path, thumb, mime, _ = save_media(upload)
-                if mime not in IMG_MIMES: st.error("Only images allowed for photo sticky."); st.stop()
+                if mime not in IMG_MIMES:
+                    st.error("Only images allowed for photo sticky."); st.stop()
                 content_text = path
+
             if type_choice == "link":
                 if not (content_text.startswith("http://") or content_text.startswith("https://")):
                     st.error("Enter a valid link (http/https)."); st.stop()
+
+            # Build due timestamp (may be None)
             due_iso = iso_utc(due_d, due_t)
+
+            # Determine next order
             row = q("SELECT COALESCE(MAX(order_index),0) m FROM notes WHERE family=? AND deleted_at IS NULL", (FAMILY,))
             next_ord = (row[0]["m"] or 0) + 1
-            exec1("""INSERT INTO notes(content,color,x,y,z,type,assignee,due_at,tags,family,order_index)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                  (content_text, color, 40, 40, next_ord, type_choice,
-                   assignee or None, due_iso, tags or None, FAMILY, next_ord))
-            st.success("Note added."); st.rerun()
 
+            # Always insert the sticky
+            exec1(
+                """INSERT INTO notes(content,color,x,y,z,type,assignee,due_at,tags,family,order_index)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (content_text, color, 40, 40, next_ord, type_choice,
+                 assignee or None, due_iso, tags or None, FAMILY, next_ord)
+            )
+
+            # Optional calendar insert
+            if add_to_calendar:
+                # Prefer a friendly title (avoid long file paths for photos)
+                event_title = (content_text if type_choice != "photo" else "Photo sticky").strip() or "Sticky"
+                if due_iso:
+                    all_day_flag = 1 if due_t is None else 0
+                    start_at = due_iso
+                else:
+                    from datetime import date
+                    all_day_flag = 1
+                    start_at = iso_utc(date.today(), None)
+                exec1(
+                    """INSERT INTO events(title, start_at, all_day, assignees, family)
+                       VALUES(?,?,?,?,?)""",
+                    (event_title, start_at, all_day_flag, assignee or "", FAMILY)
+                )
+
+            # Make sure the new sticky is visible (page 0, no filters hiding it)
+            st.session_state["notes_page"] = 0
+            st.success("Note added.")
+            st.rerun()
+
+    # Pagination + fetch
     page = st.session_state.get("notes_page", 0)
-    notes = q("""SELECT * FROM notes 
-                 WHERE family=? AND (deleted_at IS NULL) 
-                   AND (?='' OR LOWER(content) LIKE '%'||LOWER(?)||'%')
-                   AND (?='' OR LOWER(COALESCE(assignee,'')) LIKE '%'||LOWER(?)||'%')
-                   AND (?='' OR LOWER(COALESCE(tags,'')) LIKE '%'||LOWER(?)||'%')
-                 ORDER BY order_index DESC, id DESC
-                 LIMIT ? OFFSET ?""",
-              (FAMILY, f_search or "", f_search or "", f_assignee or "", f_assignee or "",
-               f_tags or "", f_tags or "", PAGE_SIZE, page*PAGE_SIZE))
+    notes = q(
+        """SELECT * FROM notes
+           WHERE family=? AND (deleted_at IS NULL)
+             AND (?='' OR LOWER(content) LIKE '%'||LOWER(?)||'%')
+             AND (?='' OR LOWER(COALESCE(assignee,'')) LIKE '%'||LOWER(?)||'%')
+             AND (?='' OR LOWER(COALESCE(tags,'')) LIKE '%'||LOWER(?)||'%')
+           ORDER BY order_index DESC, id DESC
+           LIMIT ? OFFSET ?""",
+        (FAMILY, f_search or "", f_search or "",
+         f_assignee or "", f_assignee or "",
+         f_tags or "", f_tags or "",
+         PAGE_SIZE, page * PAGE_SIZE)
+    )
 
+    # Apply due-date filter (client side)
     def include_due(n):
-        if f_due == "All": return True
-        if not n["due_at"]: return False
+        if f_due == "All":
+            return True
+        if not n["due_at"]:
+            return False
         try:
             dt = parse_aware(n["due_at"])
         except Exception:
@@ -840,13 +994,14 @@ with tabs[0]:
 
     notes = [n for n in notes if include_due(n)]
 
-    # Drag board
+    # Drag board (optional streamlit-elements)
     st.markdown("#### Drag notes on the board (positions are saved)")
     if ELEMENTS_OK and notes:
         def to_grid(n) -> Dict:
             x_units = max(0, min(11, int((n["x"] or 40) // 80)))
             y_units = max(0, int((n["y"] or 40) // 60))
             return dict(i=str(n["id"]), x=x_units, y=y_units, w=4, h=3, static=False)
+
         layout = [dashboard.Item(**to_grid(n)) for n in notes]
 
         with elements("corkboard_grid"):
@@ -857,18 +1012,21 @@ with tabs[0]:
             ):
                 for n in notes:
                     key = str(n["id"])
-                    with mui.Paper(key=key, elevation=3,
-                                   sx={"p":1,"backgroundColor": n["color"],"overflow":"hidden","cursor":"grab"}):
+                    with mui.Paper(
+                        key=key, elevation=3,
+                        sx={"p": 1, "backgroundColor": n["color"], "overflow": "hidden", "cursor": "grab"}
+                    ):
                         mui.Typography((n["type"] or "text").capitalize(), variant="caption")
                         if n["type"] == "link":
-                            mui.Link(esc(n["content"]), href=n["content"], target="_blank", rel="noopener")
+                            mui.Link(n["content"], href=n["content"], target="_blank", rel="noopener")
                         elif n["type"] == "photo" and os.path.exists(n["content"]):
-                            html.img(src=n["content"], style={"width":"100%","borderRadius":"6px"})
+                            html.img(src=n["content"], style={"width": "100%", "borderRadius": "6px"})
                         else:
-                            mui.Typography(esc(n["content"][:240]) + ("…" if len(n["content"])>240 else ""))
+                            txt = (n["content"] or "")[:240]
+                            mui.Typography(txt + ("…" if len(n["content"] or "") > 240 else ""))
 
-        # Persist positions
-        for state_key in ["elements/corkboard_grid","corkboard_grid"]:
+        # Persist positions after drag
+        for state_key in ["elements/corkboard_grid", "corkboard_grid"]:
             if state_key in st.session_state and "layout" in st.session_state[state_key]:
                 for item in st.session_state[state_key]["layout"]:
                     nid = int(item["i"])
@@ -879,23 +1037,29 @@ with tabs[0]:
 
         st.caption("Positions auto-save. Need to force it?")
         if st.button("💾 Save layout now"):
-            for state_key in ["elements/corkboard_grid","corkboard_grid"]:
+            for state_key in ["elements/corkboard_grid", "corkboard_grid"]:
                 if state_key in st.session_state and "layout" in st.session_state[state_key]:
                     for item in st.session_state[state_key]["layout"]:
-                        nid = int(item["i"]); x_px = item["x"]*80; y_px = item["y"]*60
+                        nid = int(item["i"])
+                        x_px = item["x"] * 80
+                        y_px = item["y"] * 60
                         exec1("UPDATE notes SET x=?, y=? WHERE id=? AND family=?", (x_px, y_px, nid, FAMILY))
             st.success("Layout saved.")
     elif not ELEMENTS_OK:
         st.info("Install `pip install streamlit-elements` to drag notes freely (optional).")
 
-    c1,c2,c3 = st.columns(3)
+    # Pager controls
+    c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("◀ Prev", disabled=page==0, key="notes_prev"):
-            st.session_state["notes_page"] = max(0, page-1); st.rerun()
+        if st.button("◀ Prev", disabled=page == 0, key="notes_prev"):
+            st.session_state["notes_page"] = max(0, page - 1)
+            st.rerun()
     with c3:
-        if st.button("Next ▶", disabled=len(notes)<PAGE_SIZE, key="notes_next"):
-            st.session_state["notes_page"] = page+1; st.rerun()
+        if st.button("Next ▶", disabled=len(notes) < PAGE_SIZE, key="notes_next"):
+            st.session_state["notes_page"] = page + 1
+            st.rerun()
 
+    # List view
     if not notes:
         st.info("No notes match filters on this page.")
     else:
@@ -904,7 +1068,8 @@ with tabs[0]:
             with cols[i % 2]:
                 with st.container(border=True):
                     meta = []
-                    if n["assignee"]: meta.append(f"👤 {esc(n['assignee'])}")
+                    if n["assignee"]:
+                        meta.append(f"👤 {esc(n['assignee'])}")
                     if n["due_at"]:
                         try:
                             due_dt = parse_aware(n["due_at"])
@@ -912,9 +1077,12 @@ with tabs[0]:
                             meta.append(("⏰ " if not overdue else "⚠️ Overdue ") + due_dt.strftime("%b %d %I:%M%p UTC"))
                         except Exception:
                             meta.append("⏰ " + esc(n["due_at"]))
-                    if n["tags"]: meta.append("🏷 " + esc(n["tags"]))
-                    if meta: st.caption(" • ".join(meta))
-                    if n["type"] in (None,"text"):
+                    if n["tags"]:
+                        meta.append("🏷 " + esc(n["tags"]))
+                    if meta:
+                        st.caption(" • ".join(meta))
+
+                    if n["type"] in (None, "text"):
                         st.markdown(
                             f"<div style='background:{n['color']};padding:10px;border-radius:8px;min-height:80px'>{esc(n['content'])}</div>",
                             unsafe_allow_html=True
@@ -923,7 +1091,8 @@ with tabs[0]:
                         url = n["content"]
                         if url.startswith("http://") or url.startswith("https://"):
                             st.markdown(
-                                f"<div style='background:{n['color']};padding:10px;border-radius:8px'>🔗 <a href='{esc(url)}' target='_blank' rel='noopener'>{esc(url)}</a></div>",
+                                f"<div style='background:{n['color']};padding:10px;border-radius:8px'>🔗 "
+                                f"<a href='{esc(url)}' target='_blank' rel='noopener'>{esc(url)}</a></div>",
                                 unsafe_allow_html=True
                             )
                         else:
@@ -934,12 +1103,16 @@ with tabs[0]:
                         else:
                             st.warning("Photo missing on disk.")
                     elif n["type"] == "reminder":
-                        st.markdown(f"<div style='background:{n['color']};padding:10px;border-radius:8px'>⏰ {esc(n['content'])}</div>", unsafe_allow_html=True)
+                        st.markdown(
+                            f"<div style='background:{n['color']};padding:10px;border-radius:8px'>⏰ {esc(n['content'])}</div>",
+                            unsafe_allow_html=True
+                        )
 
+                    # Reactions + comments
                     rx = q("SELECT emoji, COUNT(*) c FROM reactions WHERE note_id=? GROUP BY emoji", (n["id"],))
                     counts = {row["emoji"]: row["c"] for row in rx}
                     if counts:
-                        st.caption(" ".join([f"{e} {counts.get(e,0)}" for e in EMOJI_CHOICES if e in counts]))
+                        st.caption(" ".join([f"{e} {counts.get(e, 0)}" for e in EMOJI_CHOICES if e in counts]))
 
                     with st.expander("💬 Comments & Reactions"):
                         ecols = st.columns(len(EMOJI_CHOICES))
@@ -954,49 +1127,62 @@ with tabs[0]:
                                               (n["id"], emoji, DISPLAY_NAME))
                                     st.rerun()
                         if st.button("Clear all reactions", key=f"clear_rx_{n['id']}"):
-                            exec1("DELETE FROM reactions WHERE note_id=?", (n["id"],)); st.rerun()
+                            exec1("DELETE FROM reactions WHERE note_id=?", (n["id"],))
+                            st.rerun()
+
                         with st.form(f"add_comment_{n['id']}", clear_on_submit=True):
                             txt = st.text_input("Add a comment", placeholder="Type and press Enter")
                             if st.form_submit_button("Comment") and (txt or "").strip():
                                 exec1("INSERT INTO comments(note_id, author, text) VALUES(?,?,?)",
                                       (n["id"], DISPLAY_NAME, txt.strip()))
                                 st.rerun()
+
                         com = q("SELECT * FROM comments WHERE note_id=? ORDER BY id DESC LIMIT 50", (n["id"],))
                         if not com:
                             st.caption("No comments yet.")
                         else:
                             for c in com:
-                                row = st.columns([6,1])
+                                row = st.columns([6, 1])
                                 with row[0]:
                                     ts = c["created_at"]
-                                    st.markdown(f"**{esc(c['author'])}** · {esc(ts)}<br/>{esc(c['text'])}", unsafe_allow_html=True)
+                                    st.markdown(f"**{esc(c['author'])}** · {esc(ts)}<br/>{esc(c['text'])}",
+                                                unsafe_allow_html=True)
                                 with row[1]:
                                     if st.button("🗑️", key=f"del_comment_{c['id']}"):
-                                        exec1("DELETE FROM comments WHERE id=?", (c["id"],)); st.rerun()
+                                        exec1("DELETE FROM comments WHERE id=?", (c["id"],))
+                                        st.rerun()
 
+                    # Link / Delete / Promote
                     with st.expander("Link / Delete / Promote"):
                         if n["type"] == "reminder":
                             st.markdown("**Promote to Calendar Event**")
                             ev_d = st.date_input(f"Start date #{n['id']}", value=date.today())
-                            ev_s = st.time_input(f"Start time #{n['id']}", value=time(9,0))
-                            ev_e = st.time_input(f"End time #{n['id']}", value=time(10,0))
+                            ev_s = st.time_input(f"Start time #{n['id']}", value=time(9, 0))
+                            ev_e = st.time_input(f"End time #{n['id']}", value=time(10, 0))
                             all_day = st.checkbox(f"All-day #{n['id']}", value=False)
                             if st.button("Create Event from Reminder", key=f"note2event_{n['id']}"):
                                 s_iso = iso_utc(ev_d, None if all_day else ev_s)
                                 e_iso = iso_utc(ev_d, None if all_day else ev_e)
-                                exec1("""INSERT INTO events(title, start_at, end_at, all_day, assignees, family) 
-                                         VALUES(?,?,?,?,?,?)""",
-                                      (n["content"], s_iso, e_iso, 1 if all_day else 0, n["assignee"] or "", FAMILY))
+                                exec1(
+                                    """INSERT INTO events(title, start_at, end_at, all_day, assignees, family)
+                                       VALUES(?,?,?,?,?,?)""",
+                                    (n["content"], s_iso, e_iso, 1 if all_day else 0, n["assignee"] or "", FAMILY)
+                                )
                                 new_ev = q("SELECT id FROM events WHERE family=? ORDER BY id DESC LIMIT 1", (FAMILY,))
                                 if new_ev:
                                     exec1("UPDATE notes SET linked_event_id=? WHERE id=?", (new_ev[0]["id"], n["id"]))
                                 st.success("Event created."); st.rerun()
+
                         if n["linked_event_id"]:
                             if st.button("Unlink Event", key=f"unlink_{n['id']}"):
-                                exec1("UPDATE notes SET linked_event_id=NULL WHERE id=?", (n["id"],)); st.success("Unlinked."); st.rerun()
+                                exec1("UPDATE notes SET linked_event_id=NULL WHERE id=?", (n["id"],))
+                                st.success("Unlinked."); st.rerun()
+
                         del_ok = st.checkbox(f"Soft delete note #{n['id']}", key=f"conf_note_{n['id']}")
                         if st.button("🗑️ Delete Note", key=f"del_note_{n['id']}") and del_ok:
-                            exec1("UPDATE notes SET deleted_at=? WHERE id=? AND family=?", (now_iso_utc(), n["id"], FAMILY)); st.rerun()
+                            exec1("UPDATE notes SET deleted_at=? WHERE id=? AND family=?", (now_iso_utc(), n["id"], FAMILY))
+                            st.rerun()
+# ------------------ END CORKBOARD ------------------
 
 # -------------------- LISTS --------------------
 with tabs[1]:
