@@ -65,12 +65,171 @@ try:
     MOVIEPY_OK = True
 except Exception:
     MOVIEPY_OK = False
+# === ADD-ON BLOCK A: Utilities & Add-on schema (profiles, rsvp, settings, reset, sticky, theme) ===
+def _init_addon_schema():
+    c = get_conn(); cur = c.cursor()
+    # Profiles (per Family + unique username)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_profiles(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            family TEXT NOT NULL,
+            username TEXT NOT NULL,
+            first_name TEXT,
+            last_name TEXT,
+            avatar_path TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(family, username)
+        );
+    """)
+    # App settings (key/value by family) — for last_active_user, theme, etc.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings(
+            family TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT,
+            PRIMARY KEY (family, key)
+        );
+    """)
+    # RSVPs for events
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS event_rsvps(
+            event_id INTEGER NOT NULL,
+            username TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('going','maybe','cant')),
+            responded_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY(event_id, username),
+            FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE
+        );
+    """)
+    c.commit()
+
+def _get_setting(family:str, key:str, default:str|None=None) -> str|None:
+    rows = q("SELECT value FROM app_settings WHERE family=? AND key=? LIMIT 1", (family, key))
+    return (rows[0]["value"] if rows else default)
+
+def _set_setting(family:str, key:str, value:str|None):
+    if value is None:
+        exec1("DELETE FROM app_settings WHERE family=? AND key=?", (family, key))
+    else:
+        exec1("INSERT INTO app_settings(family, key, value) VALUES(?,?,?) ON CONFLICT(family,key) DO UPDATE SET value=excluded.value",
+              (family, key, value))
+
+def _get_or_create_profile(family:str, username:str, first:str|None=None, last:str|None=None) -> dict:
+    rows = q("SELECT * FROM user_profiles WHERE family=? AND username=? LIMIT 1", (family, username))
+    if rows:
+        return dict(rows[0])
+    exec1("INSERT OR IGNORE INTO user_profiles(family, username, first_name, last_name) VALUES(?,?,?,?)",
+          (family, username, first or None, last or None))
+    rows = q("SELECT * FROM user_profiles WHERE family=? AND username=? LIMIT 1", (family, username))
+    return dict(rows[0]) if rows else {}
+
+def _save_avatar(upload) -> str|None:
+    try:
+        path, thumb, mime, mtype = save_media(upload)
+        if mtype != "image":
+            return None
+        return thumb or path
+    except Exception:
+        return None
+
+def _sticky_user_bootstrap():
+    """
+    Run AFTER init_schema() and BEFORE you read DISPLAY_NAME/FAMILY.
+    Uses query params + app_settings to keep user/family sticky across refresh.
+    """
+    try:
+        qp = st.query_params
+    except Exception:
+        qp = {}
+
+    # Initialize session defaults
+    if "user" not in st.session_state:
+        st.session_state["user"] = qp.get("user", ["Guest"])[0] if isinstance(qp.get("user"), list) else qp.get("user", "Guest")
+    if "family" not in st.session_state:
+        st.session_state["family"] = qp.get("family", ["public"])[0] if isinstance(qp.get("family"), list) else qp.get("family", "public")
+
+    fam = st.session_state.get("family") or "public"
+    # If no user in query params, fall back to last_active_user
+    if not qp.get("user"):
+        last = _get_setting(fam, "last_active_user", None)
+        if last and st.session_state.get("user") != last:
+            st.session_state["user"] = last
+
+def _stick_user_to_url_and_settings(username:str, family:str):
+    # Update query params (so refresh keeps user/family)
+    try:
+        st.query_params.update({"user": username, "family": family})
+    except Exception:
+        pass
+    # Remember as last active for this family
+    _set_setting(family, "last_active_user", username)
+
+def _theme_css():
+    st.markdown("""
+    <style>
+      /* Make text readable in both light/dark themes via inherited colors */
+      .stApp, .stApp * { color-scheme: light dark; }
+      .stApp [data-testid="stMarkdown"] p, 
+      .stApp [data-testid="stSidebar"] * { 
+        color: inherit !important;
+      }
+      /* Inputs and captions readable in dark */
+      .stApp .stCaption,
+      .stApp [data-baseweb="base-input"] input,
+      .stApp [data-testid="stSelectbox"] div {
+        color: inherit !important;
+      }
+      /* RSVP chips */
+      .chip { display:inline-flex; align-items:center; gap:6px; padding:4px 8px; border-radius:999px; border:1px solid var(--chip-b, #ccc); margin:2px; font-size:12px;}
+      .chip img { width:20px; height:20px; border-radius:50%; object-fit:cover; }
+    </style>
+    """, unsafe_allow_html=True)
+
+def _factory_reset_ui():
+    with st.sidebar.expander("🧨 Admin · Factory Reset", expanded=False):
+        st.caption("Type **RESET** to purge all data (DB tables & /uploads).")
+        txt = st.text_input("Confirm", key="__reset_confirm__", placeholder="RESET")
+        if st.button("⚠️ Wipe everything"):
+            if txt.strip() == "RESET":
+                try:
+                    # Clear DB tables instead of deleting file to keep schema
+                    exec1("DELETE FROM reactions", ())
+                    exec1("DELETE FROM comments", ())
+                    exec1("DELETE FROM list_items", ())
+                    exec1("DELETE FROM lists", ())
+                    exec1("DELETE FROM documents", ())
+                    exec1("DELETE FROM notes", ())
+                    exec1("DELETE FROM post_comments", ())
+                    exec1("DELETE FROM post_likes", ())
+                    exec1("DELETE FROM post_media", ())
+                    exec1("DELETE FROM posts", ())
+                    exec1("DELETE FROM albums", ())
+                    exec1("DELETE FROM chat_messages", ())
+                    exec1("DELETE FROM event_rsvps", ())
+                    exec1("DELETE FROM events", ())
+                    exec1("DELETE FROM user_profiles", ())
+                    exec1("DELETE FROM app_settings", ())
+                    # Nuke uploads
+                    try:
+                        for p in UPLOAD_DIR.glob("*"):
+                            p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    # Vacuum
+                    exec1("VACUUM", ())
+                    st.success("Factory reset complete.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Reset failed: {e}")
+            else:
+                st.warning("Type RESET exactly to confirm.")
+# === END ADD-ON BLOCK A ===
 
 # ==================== CONFIG ====================
 DB_PATH = Path("hive.db")
 UPLOAD_DIR = Path("uploads"); UPLOAD_DIR.mkdir(exist_ok=True)
 
-COLOR_PRESETS = {"Default":"#FFF176","Alice":"#FFD54F","Bob":"#81C784","Charlie":"#64B5F6","Dana":"#F48FB1"}
+COLOR_PRESETS = {"Yellow":"#FFF176","Red":"#EE0E2C","Green":"#81C784","Blue":"#64B5F6","Pink":"#F48FB1"}
 EMOJI_CHOICES = ["👍","❤️","😂","🤔","✅"]
 
 MAX_MB = 200
@@ -368,7 +527,98 @@ def save_media(upload) -> Tuple[str, Optional[str], str, str]:
 # ==================== APP ====================
 st.set_page_config(page_title="🐝 The Hive", layout="wide")
 init_schema()
+# === ADD-ON BLOCK B: Boot the add-on schema + sticky user + theme CSS ===
+_init_addon_schema()          # create add-on tables if missing
+_sticky_user_bootstrap()      # apply sticky user/family before sidebar reads them
+_theme_css()                  # inject contrast-safe CSS for light/dark
+# === END ADD-ON BLOCK B ===
+# === ADD-ON BLOCK B++ : Max-contrast dark theme fix ===
+st.markdown("""
+<style>
+/* Target Streamlit's dark theme both by data attr and media query */
+html[data-theme="dark"], @media (prefers-color-scheme: dark) {
+}
 
+/* Global text */
+html[data-theme="dark"] .stApp,
+html[data-theme="dark"] .stApp * {
+  color: #e9e9e9 !important;
+}
+
+/* Markdown paragraphs, captions, labels */
+html[data-theme="dark"] .stApp [data-testid="stMarkdown"] p,
+html[data-theme="dark"] .stApp .stCaption,
+html[data-theme="dark"] .stApp label,
+html[data-theme="dark"] .stApp details > summary {
+  color: #e9e9e9 !important;
+}
+
+/* Text inputs, text areas, date/time inputs */
+html[data-theme="dark"] .stApp [data-baseweb="base-input"] input,
+html[data-theme="dark"] .stApp textarea,
+html[data-theme="dark"] .stApp [data-testid="stTextArea"] textarea,
+html[data-theme="dark"] .stApp [data-testid="stDateInput"] input,
+html[data-theme="dark"] .stApp [data-testid="stTimeInput"] input {
+  color: #e9e9e9 !important;
+  border-color: #666 !important;
+  background: transparent !important;
+}
+
+/* Placeholders */
+html[data-theme="dark"] .stApp input::placeholder,
+html[data-theme="dark"] .stApp textarea::placeholder {
+  color: #bbbbbb !important;
+}
+
+/* Selectbox and multiselect rendered area */
+html[data-theme="dark"] .stApp [data-testid="stSelectbox"] div,
+html[data-theme="dark"] .stApp [data-testid="stMultiSelect"] div[role="combobox"] {
+  color: #e9e9e9 !important;
+}
+
+/* Radio / Checkbox labels */
+html[data-theme="dark"] .stApp [role="radiogroup"],
+html[data-theme="dark"] .stApp [role="checkbox"] {
+  color: #e9e9e9 !important;
+}
+
+/* File uploader */
+html[data-theme="dark"] .stApp [data-testid="stFileUploaderDropzone"] {
+  color: #e9e9e9 !important;
+  border-color: #666 !important;
+  background: rgba(255,255,255,0.02) !important;
+}
+
+/* Expander borders / hr lines */
+html[data-theme="dark"] .stApp hr,
+html[data-theme="dark"] .stApp .st-emotion-cache-hr {
+  border-color: #444 !important;
+}
+
+/* Buttons: ensure text is visible on dark backgrounds */
+html[data-theme="dark"] .stApp button[kind="primary"],
+html[data-theme="dark"] .stApp button {
+  color: #f5f5f5 !important;
+}
+
+/* Sidebar parity */
+html[data-theme="dark"] .stApp [data-testid="stSidebar"] * {
+  color: #e9e9e9 !important;
+}
+
+/* Tabs text */
+html[data-theme="dark"] .stApp [data-baseweb="tab"] {
+  color: #e9e9e9 !important;
+}
+
+/* Chips we added for RSVP */
+html[data-theme="dark"] .stApp .chip {
+  border-color: #555 !important;
+  color: #e9e9e9 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+# === END ADD-ON BLOCK B++ ===
 # --------- Auth shim / Family selection ---------
 with st.sidebar:
     st.header("⚙️ Controls")
@@ -378,6 +628,49 @@ with st.sidebar:
     st.text_input("Family name", key="family", help="Use a unique family/group name to partition data.")
     who = st.selectbox("Color preset", list(COLOR_PRESETS.keys()), index=0)
     preset_color = COLOR_PRESETS[who]
+    # === ADD-ON BLOCK C (WRAPPED): Profile, Theme, Factory Reset — always in sidebar ===
+with st.sidebar:
+    st.markdown("---")
+    st.header("👤 Profile")
+
+    c0, c1 = st.columns([0.55, 0.45])
+    with c0:
+        first = st.text_input("First name", key="__first_name__", placeholder="e.g., Alex")
+    with c1:
+        last = st.text_input("Last name", key="__last_name__", placeholder="e.g., Morgan")
+
+    avatar_up = st.file_uploader(
+        "Profile photo (jpg/png)",
+        type=["jpg","jpeg","png"],
+        key="__avatar_up__",
+        accept_multiple_files=False
+    )
+
+    # Save / persist the profile tied to (FAMILY, DISPLAY_NAME)
+    if st.button("💾 Save Profile"):
+        fam = st.session_state.get("family") or "public"
+        user = st.session_state.get("user") or "Guest"
+        prof = _get_or_create_profile(fam, user, first, last)
+        if avatar_up is not None:
+            ap = _save_avatar(avatar_up)
+            if ap:
+                exec1(
+                    "UPDATE user_profiles SET avatar_path=?, first_name=?, last_name=? WHERE family=? AND username=?",
+                    (ap, first or None, last or None, fam, user)
+                )
+            else:
+                exec1(
+                    "UPDATE user_profiles SET first_name=?, last_name=? WHERE family=? AND username=?",
+                    (first or None, last or None, fam, user)
+                )
+        else:
+            exec1(
+                "UPDATE user_profiles SET first_name=?, last_name=? WHERE family=? AND username=?",
+                (first or None, last or None, fam, user)
+            )
+        _stick_user_to_url_and_settings(user, fam)
+        st.success("Profile saved and user anchored to URL. Refresh will keep you signed in.")
+
     st.markdown("---")
     auto = st.checkbox("Auto-refresh (every N sec)", value=False)
     secs = st.slider("Refresh interval", 2, 15, 5)
@@ -389,6 +682,79 @@ with st.sidebar:
     f_tags = st.text_input("Tags contains")
     f_due = st.selectbox("Due filter", ["All","Due today","Overdue"])
 
+  # === ADD-ON BLOCK F (REPLACEMENT): Password-gated Factory Reset ===
+def _factory_reset_ui_secured():
+    with st.sidebar.expander("🧨 Admin · Factory Reset", expanded=False):
+        st.caption("Admin-only. Enter password to unlock reset.")
+
+        # Password source: secrets or env var
+        ADMIN_KEY = None
+        try:
+            # .streamlit/secrets.toml -> ADMIN_RESET_PASSWORD = "yourpassword"
+            if hasattr(st, "secrets") and "ADMIN_RESET_PASSWORD" in st.secrets:
+                ADMIN_KEY = st.secrets["ADMIN_RESET_PASSWORD"]
+        except Exception:
+            pass
+        ADMIN_KEY = ADMIN_KEY or os.environ.get("HIVE_ADMIN_RESET")
+
+        pwd = st.text_input("Admin password", type="password", key="__reset_pwd__")
+
+        if not ADMIN_KEY:
+            st.info("No admin password configured. Set `ADMIN_RESET_PASSWORD` in .streamlit/secrets.toml "
+                    "or env var `HIVE_ADMIN_RESET` to enable this.")
+            return
+
+        if pwd != ADMIN_KEY:
+            st.caption("Enter the correct admin password to reveal the reset controls.")
+            return
+
+        # Auth OK → show the original confirmation + wipe logic (inline)
+        st.success("Authenticated.")
+        st.caption("Type **RESET** to purge all data (DB tables & /uploads).")
+        txt = st.text_input("Confirm", key="__reset_confirm__", placeholder="RESET")
+
+        if st.button("⚠️ Wipe everything"):
+            if txt.strip() == "RESET":
+                try:
+                    # Clear DB tables instead of deleting file to keep schema
+                    exec1("DELETE FROM reactions", ())
+                    exec1("DELETE FROM comments", ())
+                    exec1("DELETE FROM list_items", ())
+                    exec1("DELETE FROM lists", ())
+                    exec1("DELETE FROM documents", ())
+                    exec1("DELETE FROM notes", ())
+                    exec1("DELETE FROM post_comments", ())
+                    exec1("DELETE FROM post_likes", ())
+                    exec1("DELETE FROM post_media", ())
+                    exec1("DELETE FROM posts", ())
+                    exec1("DELETE FROM albums", ())
+                    exec1("DELETE FROM chat_messages", ())
+                    exec1("DELETE FROM event_rsvps", ())
+                    exec1("DELETE FROM events", ())
+                    exec1("DELETE FROM user_profiles", ())
+                    exec1("DELETE FROM app_settings", ())
+
+                    # Nuke uploads directory
+                    try:
+                        for p in UPLOAD_DIR.glob("*"):
+                            p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+                    # Vacuum DB
+                    exec1("VACUUM", ())
+
+                    st.success("Factory reset complete.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Reset failed: {e}")
+            else:
+                st.warning("Type RESET exactly to confirm.")
+
+_factory_reset_ui_secured()
+# === END ADD-ON BLOCK F ===
+
+# === END ADD-ON BLOCK C (WRAPPED) ===
 DISPLAY_NAME = st.session_state["user"] or "Guest"
 FAMILY = st.session_state["family"] or "public"
 
@@ -1101,6 +1467,108 @@ with tabs[3]:
                 if st.button("🗑️ Delete", key=f"del_{e['id']}"):
                     exec1("DELETE FROM events WHERE id=? AND family=?", (e["id"], FAMILY))
                     st.success("Deleted."); st.rerun()
+            # === ADD-ON BLOCK D: RSVP controls + attendee chips (inside event expander) ===
+            st.markdown("---")
+            st.markdown("#### 🗳️ RSVP")
+
+            # Current user's RSVP state
+            _r = q("SELECT status FROM event_rsvps WHERE event_id=? AND username=? LIMIT 1", (e["id"], DISPLAY_NAME))
+            _mine = (_r[0]["status"] if _r else None)
+
+            # Buttons row
+            rb1, rb2, rb3, rb4 = st.columns([0.18, 0.18, 0.18, 0.46])
+            with rb1:
+                lab = "✅ Going" + (" (you)" if _mine == "going" else "")
+                if st.button(lab, key=f"rsvp_go_{e['id']}"):
+                    exec1("""INSERT INTO event_rsvps(event_id, username, status) 
+                             VALUES(?,?,?) 
+                             ON CONFLICT(event_id, username) 
+                             DO UPDATE SET status=excluded.status, responded_at=datetime('now')""",
+                          (e["id"], DISPLAY_NAME, "going"))
+                    st.rerun()
+            with rb2:
+                lab = "🤔 Maybe" + (" (you)" if _mine == "maybe" else "")
+                if st.button(lab, key=f"rsvp_maybe_{e['id']}"):
+                    exec1("""INSERT INTO event_rsvps(event_id, username, status) 
+                             VALUES(?,?,?) 
+                             ON CONFLICT(event_id, username) 
+                             DO UPDATE SET status=excluded.status, responded_at=datetime('now')""",
+                          (e["id"], DISPLAY_NAME, "maybe"))
+                    st.rerun()
+            with rb3:
+                lab = "❌ Can't" + (" (you)" if _mine == "cant" else "")
+                if st.button(lab, key=f"rsvp_cant_{e['id']}"):
+                    exec1("""INSERT INTO event_rsvps(event_id, username, status) 
+                             VALUES(?,?,?) 
+                             ON CONFLICT(event_id, username) 
+                             DO UPDATE SET status=excluded.status, responded_at=datetime('now')""",
+                          (e["id"], DISPLAY_NAME, "cant"))
+                    st.rerun()
+            with rb4:
+                if _mine is not None:
+                    if st.button("Clear my RSVP", key=f"rsvp_clear_{e['id']}"):
+                        exec1("DELETE FROM event_rsvps WHERE event_id=? AND username=?", (e["id"], DISPLAY_NAME))
+                        st.rerun()
+                else:
+                    st.caption("No RSVP from you yet.")
+
+            # Attendees (with profile pics)
+            st.markdown("#### 👥 Attendees")
+            _rows = q("""
+                SELECT r.username, r.status,
+                       COALESCE(p.first_name,'') AS first_name,
+                       COALESCE(p.last_name,'')  AS last_name,
+                       COALESCE(p.avatar_path,'') AS avatar_path
+                FROM event_rsvps r
+                LEFT JOIN user_profiles p 
+                  ON p.family=? AND p.username=r.username
+                WHERE r.event_id=?
+                ORDER BY 
+                  CASE r.status WHEN 'going' THEN 0 WHEN 'maybe' THEN 1 ELSE 2 END,
+                  r.username COLLATE NOCASE
+            """, (FAMILY, e["id"]))
+
+            if not _rows:
+                st.caption("No RSVPs yet.")
+            else:
+                # Inline chips with color by status (no external CSS dependency)
+                def _chip_border(status: str) -> str:
+                    if status == "going": return "#1b5e20"   # green-ish
+                    if status == "maybe": return "#9e7500"   # amber-ish
+                    return "#7b1c1c"                         # red-ish
+
+                html_parts = []
+                for r in _rows:
+                    full = (r["first_name"] + " " + r["last_name"]).strip() or r["username"]
+                    full = esc(full)
+                    bcol = _chip_border(r["status"])
+                    avat = r["avatar_path"] or ""
+
+                    # Build avatar (always 32×32) inside an inline-block wrapper to avoid layout breaks
+                    if avat and os.path.exists(avat):
+                        avatar_inner = f"<img src='{esc(avat)}' style='width:100%;height:100%;object-fit:cover;'/>"
+                    else:
+                        initials = "".join([part[0].upper() for part in full.split()[:2] if part]) or "?"
+                        avatar_inner = (
+                            f"<span style='width:100%;height:100%;display:flex;align-items:center;justify-content:center;"
+                            f"background:#888;color:#fff;font-size:14px;font-weight:600'>{initials}</span>"
+                        )
+                    avatar = (
+                        f"<span style='display:inline-block;width:32px;height:32px;border-radius:50%;overflow:hidden'>"
+                        f"{avatar_inner}</span>"
+                    )
+
+                    # One self-contained chip with inline styles
+                    status_label = {"going":"Going","maybe":"Maybe","cant":"Can't"}.get(r["status"], r["status"])
+                    chip = (
+                        f"<span style='display:inline-flex;align-items:center;gap:8px;padding:6px 10px;"
+                        f"border-radius:999px;border:1px solid {bcol};margin:2px;font-size:13px;line-height:1;'>"
+                        f"{avatar}<span>{full}</span><span style='opacity:0.7'>· {status_label}</span></span>"
+                    )
+                    html_parts.append(chip)
+
+                st.markdown(" ".join(html_parts), unsafe_allow_html=True)
+            # === END ADD-ON BLOCK D ===
 
 # -------------------- FAMILY FEED --------------------
 with tabs[4]:
@@ -1245,7 +1713,7 @@ with tabs[5]:
 
     st.markdown("---")
 
-    # ---- Fetch last N messages (descending then reverse to chronological) ----
+    # ---- Fetch last N messages ----
     LAST_N = 100
     rows_desc = q("""SELECT * FROM chat_messages 
                      WHERE family=? AND room=?
@@ -1253,51 +1721,74 @@ with tabs[5]:
                      LIMIT ?""", (FAMILY, room, LAST_N))
     msgs = list(reversed(rows_desc))
 
-    # Track "last seen" per room to detect new messages from others
     state_key = f"last_seen_chat_{FAMILY}_{room}"
     prev_seen = int(st.session_state.get(state_key, 0) or 0)
     last_id = int(msgs[-1]["id"]) if msgs else 0
     new_from_others = [m for m in msgs if m["id"] > prev_seen and m["author"] != DISPLAY_NAME]
     new_count = len(new_from_others)
 
-    # ---- Styles for scroll box + bubbles ----
-    st.markdown(
-        """
-        <style>
-        .chat-box {
-            max-height: 520px;
-            overflow-y: auto;
-            padding: 8px 10px;
-            border: 1px solid #ddd;
-            border-radius: 10px;
-            background: #fafafa;
-        }
-        .msg {
-            margin: 6px 0;
-            display: flex;
-            flex-direction: column;
-        }
-        .msg .meta {
-            font-size: 11px;
-            color: #666;
-            margin: 0 6px 2px 6px;
-        }
-        .bubble {
-            display: inline-block;
-            padding: 8px 12px;
-            border-radius: 14px;
-            background: #ffffff;
-            border: 1px solid #e6e6e6;
-            max-width: 85%;
-            word-wrap: break-word;
-            white-space: pre-wrap;
-        }
-        .me { align-items: flex-end; }
-        .me .bubble { background: #e8f0ff; border-color: #d0dcff; }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
+    st.markdown("""
+<style>
+.chat-box {
+    max-height: 520px;
+    overflow-y: auto;
+    padding: 8px 10px;
+    border: 1px solid #ddd;
+    border-radius: 10px;
+    background: #fafafa;
+}
+[data-theme="dark"] .chat-box {
+    background: #121212;
+    border-color: #2e2e2e;
+}
+
+.msg {
+    margin: 6px 0;
+    display: flex;
+    flex-direction: column;
+}
+.msg .meta {
+    font-size: 11px;
+    color: #666;
+    margin: 0 6px 2px 6px;
+}
+[data-theme="dark"] .msg .meta {
+    color: #c8c8c8;
+}
+
+.bubble {
+    display: inline-block;
+    padding: 8px 12px;
+    border-radius: 14px;
+    background: #ffffff;
+    border: 1px solid #e6e6e6;
+    color: #000000;
+    max-width: 85%;
+    word-wrap: break-word;
+    white-space: pre-wrap;
+}
+[data-theme="dark"] .bubble {
+    background: #1d1f22;
+    border-color: #2f3236;
+    color: #f0f0f0;
+}
+[data-theme="dark"] .bubble a {
+    color: #a7c7ff;
+}
+
+.me {
+    align-items: flex-end;
+}
+.me .bubble {
+    background: #e8f0ff;
+    border-color: #d0dcff;
+}
+[data-theme="dark"] .me .bubble {
+    background: #18314f;
+    border-color: #2b4a6f;
+}
+</style>
+""", unsafe_allow_html=True)
 
     # Optional room badge
     if new_count > 0:
@@ -1345,7 +1836,6 @@ with tabs[5]:
             <script>
             (function() {{
               const body = {json.dumps(str(latest_author) + ": " + str(latest_text))}.slice(0, 160);
-              // Request permission if needed
               if (typeof Notification !== 'undefined') {{
                 if (Notification.permission === 'default') {{
                   Notification.requestPermission();
@@ -1355,7 +1845,6 @@ with tabs[5]:
                   setTimeout(() => n.close(), 5000);
                 }}
               }}
-              // Beep using WebAudio (very short)
               try {{
                 const Ctx = window.AudioContext || window.webkitAudioContext;
                 const ctx = new Ctx();
@@ -1376,7 +1865,7 @@ with tabs[5]:
             unsafe_allow_html=True
         )
 
-    # ---- Quick delete of your recent messages (keeps buttons out of the scroll area) ----
+    # ---- Quick delete of your recent messages ----
     mine = q("""SELECT id, text, created_at FROM chat_messages 
                 WHERE family=? AND room=? AND author=?
                 ORDER BY id DESC LIMIT 10""", (FAMILY, room, DISPLAY_NAME))
@@ -1397,7 +1886,7 @@ with tabs[5]:
 
     st.markdown("---")
 
-    # ---- Send box (kept outside scroll, pinned) ----
+    # ---- Send box ----
     with st.form("send_message", clear_on_submit=True):
         msg = st.text_input("Message", placeholder="Type a message and press Send")
         cc1, cc2 = st.columns([0.2,0.8])
@@ -1411,7 +1900,7 @@ with tabs[5]:
                   (FAMILY, room, DISPLAY_NAME, msg.strip()))
             st.rerun()
 
-    # Update last seen AFTER rendering and notifications, so next refresh only alerts on newer
+    # ---- Finalize "last seen" state ----
     st.session_state[state_key] = last_id
 
 # =============================================================================
