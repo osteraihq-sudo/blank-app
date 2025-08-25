@@ -226,8 +226,11 @@ def _factory_reset_ui():
 # === END ADD-ON BLOCK A ===
 
 # ==================== CONFIG ====================
-DB_PATH = Path("hive.db")
-UPLOAD_DIR = Path("uploads"); UPLOAD_DIR.mkdir(exist_ok=True)
+# ==================== CONFIG ====================
+DB_PATH = Path(os.environ.get("HIVE_DB_PATH", "/tmp/hive.db"))
+UPLOAD_DIR = Path(os.environ.get("HIVE_UPLOAD_DIR", "/tmp/uploads"))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
 
 COLOR_PRESETS = {"Yellow":"#FFF176","Red":"#EE0E2C","Green":"#81C784","Blue":"#64B5F6","Pink":"#F48FB1"}
 EMOJI_CHOICES = ["👍","❤️","😂","🤔","✅"]
